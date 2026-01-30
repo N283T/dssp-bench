@@ -29,11 +29,13 @@
 #endif
 
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 
 #include <cif++.hpp>
 #include <mcfp/mcfp.hpp>
@@ -253,6 +255,144 @@ cif::file load_json_structure(const fs::path &path)
 
 // --------------------------------------------------------------------
 
+// Map single letter code to 3-letter compound ID
+std::map<char, std::string> kAminoAcidMap = {
+	{'A', "ALA"}, {'C', "CYS"}, {'D', "ASP"}, {'E', "GLU"}, {'F', "PHE"},
+	{'G', "GLY"}, {'H', "HIS"}, {'I', "ILE"}, {'K', "LYS"}, {'L', "LEU"},
+	{'M', "MET"}, {'N', "ASN"}, {'P', "PRO"}, {'Q', "GLN"}, {'R', "ARG"},
+	{'S', "SER"}, {'T', "THR"}, {'V', "VAL"}, {'W', "TRP"}, {'Y', "TYR"},
+	{'X', "UNK"}
+};
+
+// Write JSON output compatible with dssp_zig format
+void write_json_output(std::ostream &os, const dssp &d)
+{
+	auto stats = d.get_statistics();
+
+	json output;
+
+	// Statistics section
+	output["statistics"] = {
+		{"total_residues", stats.count.residues},
+		{"complete_residues", stats.count.residues},  // mkdssp doesn't track incomplete separately
+		{"chain_breaks", stats.count.chains > 0 ? stats.count.chains - 1 : 0},
+		{"hbond_count", stats.count.H_bonds},
+		{"ss_bond_count", stats.count.SS_bridges}
+	};
+
+	// Build residue index map for hbond references
+	std::map<std::tuple<std::string, int>, int> residue_index;
+	int idx = 0;
+	for (const auto &res : d)
+	{
+		residue_index[{res.asym_id(), res.seq_id()}] = idx++;
+	}
+
+	// Residues array
+	json residues = json::array();
+	for (const auto &res : d)
+	{
+		json r;
+
+		r["chain_id"] = res.asym_id();
+		r["seq_id"] = res.seq_id();
+		r["compound_id"] = res.compound_id();
+		r["residue_type"] = std::string(1, res.compound_letter());
+		r["secondary_structure"] = std::string(1, static_cast<char>(res.type()));
+		r["accessibility"] = std::round(res.accessibility() * 10.0) / 10.0;  // Round to 1 decimal
+
+		// Angles
+		json angles;
+		if (auto phi = res.phi(); phi.has_value())
+			angles["phi"] = std::round(*phi * 10.0) / 10.0;
+		else
+			angles["phi"] = nullptr;
+
+		if (auto psi = res.psi(); psi.has_value())
+			angles["psi"] = std::round(*psi * 10.0) / 10.0;
+		else
+			angles["psi"] = nullptr;
+
+		if (auto omega = res.omega(); omega.has_value())
+			angles["omega"] = std::round(*omega * 10.0) / 10.0;
+		else
+			angles["omega"] = nullptr;
+
+		if (auto kappa = res.kappa(); kappa.has_value())
+			angles["kappa"] = std::round(*kappa * 10.0) / 10.0;
+		else
+			angles["kappa"] = nullptr;
+
+		if (auto alpha = res.alpha(); alpha.has_value())
+			angles["alpha"] = std::round(*alpha * 10.0) / 10.0;
+		else
+			angles["alpha"] = nullptr;
+
+		if (auto tco = res.tco(); tco.has_value())
+			angles["tco"] = std::round(*tco * 10.0) / 10.0;
+		else
+			angles["tco"] = nullptr;
+
+		r["angles"] = angles;
+
+		// Hydrogen bonds
+		json hbonds;
+
+		// Donors (N-H-->O)
+		for (int i = 0; i < 2; ++i)
+		{
+			auto [partner, energy] = res.donor(i);
+			json bond;
+			if (partner && residue_index.count({partner.asym_id(), partner.seq_id()}))
+			{
+				bond["residue"] = residue_index[{partner.asym_id(), partner.seq_id()}];
+				bond["energy"] = std::round(energy * 1000.0) / 1000.0;
+			}
+			else
+			{
+				bond["residue"] = nullptr;
+				bond["energy"] = 0.0;
+			}
+			hbonds["donor_" + std::to_string(i)] = bond;
+		}
+
+		// Acceptors (O-->H-N)
+		for (int i = 0; i < 2; ++i)
+		{
+			auto [partner, energy] = res.acceptor(i);
+			json bond;
+			if (partner && residue_index.count({partner.asym_id(), partner.seq_id()}))
+			{
+				bond["residue"] = residue_index[{partner.asym_id(), partner.seq_id()}];
+				bond["energy"] = std::round(energy * 1000.0) / 1000.0;
+			}
+			else
+			{
+				bond["residue"] = nullptr;
+				bond["energy"] = 0.0;
+			}
+			hbonds["acceptor_" + std::to_string(i)] = bond;
+		}
+
+		r["hbonds"] = hbonds;
+
+		// Sheet and strand
+		r["sheet"] = res.sheet();
+		r["strand"] = res.strand();
+
+		// Complete flag (always true for mkdssp since it requires all backbone atoms)
+		r["complete"] = true;
+
+		residues.push_back(r);
+	}
+
+	output["residues"] = residues;
+
+	os << output.dump(2) << std::endl;
+}
+
+// --------------------------------------------------------------------
+
 int d_main(int argc, const char *argv[])
 {
 	using namespace std::literals;
@@ -260,7 +400,7 @@ int d_main(int argc, const char *argv[])
 	auto &config = mcfp::config::instance();
 
 	config.init("Usage: mkdssp [options] input-file [output-file]",
-		mcfp::make_option<std::string>("output-format", "Output format, can be either 'dssp' for classic DSSP or 'mmcif' for annotated mmCIF. The default is chosen based on the extension of the output file, if any."),
+		mcfp::make_option<std::string>("output-format", "Output format: 'dssp' for classic DSSP, 'mmcif' for annotated mmCIF, or 'json' for JSON (compatible with dssp_zig). Default is chosen based on output file extension."),
 		mcfp::make_option<short>("min-pp-stretch", 3, "Minimal number of residues having PSI/PHI in range for a PP helix, default is 3"),
 		mcfp::make_option("write-other", "If set, write the type OTHER for loops, default is to leave this out"),
 		mcfp::make_option("no-dssp-categories", "If set, will suppress output of new DSSP output in mmCIF format"),
@@ -294,9 +434,9 @@ int d_main(int argc, const char *argv[])
 		exit(config.has("help") ? 0 : 1);
 	}
 
-	if (config.has("output-format") and config.get<std::string>("output-format") != "dssp" and config.get<std::string>("output-format") != "mmcif")
+	if (config.has("output-format") and config.get<std::string>("output-format") != "dssp" and config.get<std::string>("output-format") != "mmcif" and config.get<std::string>("output-format") != "json")
 	{
-		std::cerr << "Output format should be one of 'dssp' or 'mmcif'" << std::endl;
+		std::cerr << "Output format should be one of 'dssp', 'mmcif', or 'json'" << std::endl;
 		exit(1);
 	}
 
@@ -394,11 +534,15 @@ int d_main(int argc, const char *argv[])
 		{
 			if (output.stem().extension() == ".dssp")
 				fmt = "dssp";
+			else if (output.stem().extension() == ".json")
+				fmt = "json";
 			else
 				fmt = "cif";
 		}
 		else if (output.extension() == ".dssp")
 			fmt = "dssp";
+		else if (output.extension() == ".json")
+			fmt = "json";
 		else
 			fmt = "cif";
 	}
@@ -419,7 +563,7 @@ int d_main(int argc, const char *argv[])
 
 	auto dssp_start = std::chrono::high_resolution_clock::now();
 
-	dssp dssp(f.front(), 1, pp_stretch, fmt == "dssp" or config.has("calculate-accessibility"));
+	dssp dssp(f.front(), 1, pp_stretch, fmt == "dssp" or fmt == "json" or config.has("calculate-accessibility"));
 
 	auto dssp_end = std::chrono::high_resolution_clock::now();
 
@@ -471,6 +615,8 @@ int d_main(int argc, const char *argv[])
 
 		if (fmt == "dssp")
 			dssp.write_legacy_output(out);
+		else if (fmt == "json")
+			write_json_output(out, dssp);
 		else
 		{
 			dssp.annotate(f.front(), writeOther, not config.has("no-dssp-categories"));
@@ -481,6 +627,8 @@ int d_main(int argc, const char *argv[])
 	{
 		if (fmt == "dssp")
 			dssp.write_legacy_output(std::cout);
+		else if (fmt == "json")
+			write_json_output(std::cout, dssp);
 		else
 		{
 			dssp.annotate(f.front(), writeOther, not config.has("no-dssp-categories"));
