@@ -37,11 +37,13 @@
 
 #include <cif++.hpp>
 #include <mcfp/mcfp.hpp>
+#include <nlohmann/json.hpp>
 
 #include "dssp.hpp"
 #include "revision.hpp"
 
 namespace fs = std::filesystem;
+using json = nlohmann::json;
 
 // --------------------------------------------------------------------
 
@@ -58,6 +60,195 @@ void print_what(const std::exception &e)
 		std::cerr << " >> ";
 		print_what(nested);
 	}
+}
+
+// --------------------------------------------------------------------
+
+// Check if the file is a JSON file based on extension
+bool is_json_file(const fs::path &path)
+{
+	auto ext = path.extension();
+	if (ext == ".gz" or ext == ".xz")
+		ext = path.stem().extension();
+	return ext == ".json";
+}
+
+// Load JSON and create a cif::datablock for DSSP processing
+cif::file load_json_structure(const fs::path &path)
+{
+	// Read and decompress if needed
+	std::string content;
+	{
+		cif::gzio::ifstream in(path);
+		if (not in.is_open())
+			throw std::runtime_error("Could not open JSON file");
+
+		std::ostringstream ss;
+		ss << in.rdbuf();
+		content = ss.str();
+	}
+
+	auto j = json::parse(content);
+
+	// Create a new CIF file and datablock
+	cif::file f;
+	auto &db = f.emplace_back("structure");
+
+	// Create atom_site category
+	auto &atom_site = db["atom_site"];
+
+	// Create entity category (required for dssp)
+	auto &entity = db["entity"];
+	entity.emplace({
+		{"id", "1"},
+		{"type", "polymer"}
+	});
+
+	// Create struct_asym category (required for dssp)
+	auto &struct_asym = db["struct_asym"];
+	struct_asym.emplace({
+		{"id", "A"},
+		{"entity_id", "1"}
+	});
+
+	// Create entity_poly_seq for sequence information
+	auto &entity_poly_seq = db["entity_poly_seq"];
+
+	// Create pdbx_poly_seq_scheme for PDB numbering
+	auto &pdbx_poly_seq_scheme = db["pdbx_poly_seq_scheme"];
+
+	int atom_id = 1;
+	const auto &residues = j["residues"];
+
+	for (const auto &res : residues)
+	{
+		std::string chain_id = res["chain_id"].get<std::string>();
+		int seq_id = res["seq_id"].get<int>();
+		std::string compound_id = res["compound_id"].get<std::string>();
+
+		// Add to entity_poly_seq
+		entity_poly_seq.emplace({
+			{"entity_id", "1"},
+			{"num", std::to_string(seq_id)},
+			{"mon_id", compound_id}
+		});
+
+		// Add to pdbx_poly_seq_scheme
+		pdbx_poly_seq_scheme.emplace({
+			{"asym_id", chain_id},
+			{"entity_id", "1"},
+			{"seq_id", std::to_string(seq_id)},
+			{"mon_id", compound_id},
+			{"pdb_strand_id", chain_id},
+			{"pdb_seq_num", std::to_string(seq_id)},
+			{"pdb_ins_code", "."}
+		});
+
+		// Add backbone atoms (N, CA, C, O) - required for DSSP
+		const auto &atoms = res["atoms"];
+		for (const auto &[atom_name, coords] : atoms.items())
+		{
+			double x = coords[0].get<double>();
+			double y = coords[1].get<double>();
+			double z = coords[2].get<double>();
+
+			atom_site.emplace({
+				{"id", std::to_string(atom_id++)},
+				{"type_symbol", atom_name.substr(0, 1)},
+				{"label_atom_id", atom_name},
+				{"label_alt_id", "."},
+				{"label_comp_id", compound_id},
+				{"label_asym_id", chain_id},
+				{"label_entity_id", "1"},
+				{"label_seq_id", std::to_string(seq_id)},
+				{"pdbx_PDB_ins_code", "."},
+				{"Cartn_x", std::to_string(x)},
+				{"Cartn_y", std::to_string(y)},
+				{"Cartn_z", std::to_string(z)},
+				{"occupancy", "1.00"},
+				{"B_iso_or_equiv", "0.00"},
+				{"pdbx_formal_charge", "."},
+				{"auth_seq_id", std::to_string(seq_id)},
+				{"auth_comp_id", compound_id},
+				{"auth_asym_id", chain_id},
+				{"auth_atom_id", atom_name},
+				{"pdbx_PDB_model_num", "1"}
+			});
+		}
+
+		// Add side chain atoms if present
+		if (res.contains("side_chain"))
+		{
+			for (const auto &sc_atom : res["side_chain"])
+			{
+				std::string atom_name = sc_atom["name"].get<std::string>();
+				const auto &pos = sc_atom["pos"];
+				double x = pos[0].get<double>();
+				double y = pos[1].get<double>();
+				double z = pos[2].get<double>();
+
+				// Determine element from atom name
+				std::string element = atom_name.substr(0, 1);
+				if (atom_name.size() > 1 && std::islower(atom_name[1]))
+					element = atom_name.substr(0, 2);
+
+				atom_site.emplace({
+					{"id", std::to_string(atom_id++)},
+					{"type_symbol", element},
+					{"label_atom_id", atom_name},
+					{"label_alt_id", "."},
+					{"label_comp_id", compound_id},
+					{"label_asym_id", chain_id},
+					{"label_entity_id", "1"},
+					{"label_seq_id", std::to_string(seq_id)},
+					{"pdbx_PDB_ins_code", "."},
+					{"Cartn_x", std::to_string(x)},
+					{"Cartn_y", std::to_string(y)},
+					{"Cartn_z", std::to_string(z)},
+					{"occupancy", "1.00"},
+					{"B_iso_or_equiv", "0.00"},
+					{"pdbx_formal_charge", "."},
+					{"auth_seq_id", std::to_string(seq_id)},
+					{"auth_comp_id", compound_id},
+					{"auth_asym_id", chain_id},
+					{"auth_atom_id", atom_name},
+					{"pdbx_PDB_model_num", "1"}
+				});
+			}
+		}
+	}
+
+	// Add disulfide bonds if present
+	if (j.contains("ss_bonds"))
+	{
+		auto &struct_conn = db["struct_conn"];
+		int conn_id = 1;
+
+		for (const auto &bond : j["ss_bonds"])
+		{
+			std::string chain1 = bond["chain1"].get<std::string>();
+			int seq1 = bond["seq1"].get<int>();
+			std::string chain2 = bond["chain2"].get<std::string>();
+			int seq2 = bond["seq2"].get<int>();
+
+			struct_conn.emplace({
+				{"id", "disulf" + std::to_string(conn_id++)},
+				{"conn_type_id", "disulf"},
+				{"ptnr1_label_asym_id", chain1},
+				{"ptnr1_label_comp_id", "CYS"},
+				{"ptnr1_label_seq_id", std::to_string(seq1)},
+				{"ptnr1_label_atom_id", "SG"},
+				{"ptnr2_label_asym_id", chain2},
+				{"ptnr2_label_comp_id", "CYS"},
+				{"ptnr2_label_seq_id", std::to_string(seq2)},
+				{"ptnr2_label_atom_id", "SG"},
+				{"pdbx_ptnr1_PDB_ins_code", "."},
+				{"pdbx_ptnr2_PDB_ins_code", "."}
+			});
+		}
+	}
+
+	return f;
 }
 
 // --------------------------------------------------------------------
@@ -129,36 +320,53 @@ int d_main(int argc, const char *argv[])
 	}
 
 	cif::file f;
+	fs::path input_path = config.operands().front();
+	bool is_json = is_json_file(input_path);
 
 	auto parse_start = std::chrono::high_resolution_clock::now();
 
-	try
+	if (is_json)
 	{
-		cif::gzio::ifstream in(config.operands().front());
-		if (not in.is_open())
-		{
-			std::cerr << "Could not open file" << std::endl;
-			exit(1);
-		}
-
+		// Load JSON format
 		if (cif::VERBOSE > 0)
-			std::cerr << "Loading file...";
+			std::cerr << "Loading JSON file...";
 
-		f.load(in);
-
-		if (cif::VERBOSE > 0)
-			std::cerr << " fixup file...";
-
-		cif::pdb::fixup_pdbx(f);
+		f = load_json_structure(input_path);
 
 		if (cif::VERBOSE > 0)
 			std::cerr << " done\n";
 	}
-	catch (const std::exception &e)
+	else
 	{
-		std::cerr << e.what() << '\n';
+		// Load CIF/PDB format
+		try
+		{
+			cif::gzio::ifstream in(input_path);
+			if (not in.is_open())
+			{
+				std::cerr << "Could not open file" << std::endl;
+				exit(1);
+			}
 
-		f = cif::pdb::read(config.operands().front());
+			if (cif::VERBOSE > 0)
+				std::cerr << "Loading file...";
+
+			f.load(in);
+
+			if (cif::VERBOSE > 0)
+				std::cerr << " fixup file...";
+
+			cif::pdb::fixup_pdbx(f);
+
+			if (cif::VERBOSE > 0)
+				std::cerr << " done\n";
+		}
+		catch (const std::exception &e)
+		{
+			std::cerr << e.what() << '\n';
+
+			f = cif::pdb::read(input_path);
+		}
 	}
 
 	auto parse_end = std::chrono::high_resolution_clock::now();

@@ -117,6 +117,13 @@ CPMFindPackage(
 	GIT_TAG v1.4.2
 	EXCLUDE_FROM_ALL YES)
 
+# JSON library for JSON input support
+CPMAddPackage(
+	NAME nlohmann_json
+	GIT_REPOSITORY https://github.com/nlohmann/json
+	GIT_TAG v3.11.3
+	EXCLUDE_FROM_ALL YES)
+
 # No longer using CPM for libcifpp. It is now simply required to install it first.
 find_package(cifpp 9.0.6 QUIET)
 
@@ -147,7 +154,7 @@ endif()
 
 add_executable(mkdssp ${CMAKE_CURRENT_SOURCE_DIR}/src/mkdssp.cpp)
 
-target_link_libraries(mkdssp PRIVATE mcfp::mcfp dssp::dssp)
+target_link_libraries(mkdssp PRIVATE mcfp::mcfp dssp::dssp nlohmann_json::nlohmann_json)
 
 if(USE_RSRC)
 	mrc_target_resources(mkdssp
