@@ -28,9 +28,11 @@
 # include "config.hpp"
 #endif
 
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 
 #include <cif++.hpp>
@@ -80,6 +82,7 @@ int d_main(int argc, const char *argv[])
 		mcfp::make_option("version", "Print version"),
 		mcfp::make_option("verbose,v", "verbose output"),
 		mcfp::make_option("quiet", "Reduce verbose output to a minimum"),
+		mcfp::make_option("timing", "Show timing breakdown for benchmarking"),
 
 		mcfp::make_hidden_option<int>("debug,d", "Debug level (for even more verbose output)"));
 
@@ -127,6 +130,8 @@ int d_main(int argc, const char *argv[])
 
 	cif::file f;
 
+	auto parse_start = std::chrono::high_resolution_clock::now();
+
 	try
 	{
 		cif::gzio::ifstream in(config.operands().front());
@@ -155,6 +160,8 @@ int d_main(int argc, const char *argv[])
 
 		f = cif::pdb::read(config.operands().front());
 	}
+
+	auto parse_end = std::chrono::high_resolution_clock::now();
 
 	// --------------------------------------------------------------------
 
@@ -201,7 +208,24 @@ int d_main(int argc, const char *argv[])
 		}
 	}
 
+	auto dssp_start = std::chrono::high_resolution_clock::now();
+
 	dssp dssp(f.front(), 1, pp_stretch, fmt == "dssp" or config.has("calculate-accessibility"));
+
+	auto dssp_end = std::chrono::high_resolution_clock::now();
+
+	if (config.has("timing"))
+	{
+		auto parse_ms = std::chrono::duration<double, std::milli>(parse_end - parse_start).count();
+		auto dssp_ms = std::chrono::duration<double, std::milli>(dssp_end - dssp_start).count();
+		auto stats = dssp.get_statistics();
+
+		// Output in dssp-zig compatible format for benchmark runner
+		std::cerr << "TIMING: residues=" << stats.count.residues
+		          << " parse_ms=" << std::fixed << std::setprecision(3) << parse_ms
+		          << " calc_total_ms=" << dssp_ms
+		          << std::endl;
+	}
 
 	if (not output.empty())
 	{
